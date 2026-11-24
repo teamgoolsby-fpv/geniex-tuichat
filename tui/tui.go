@@ -338,8 +338,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inputTokens += msg.inputTok
 		m.outputTokens += msg.outTok
 		m.ctxTokens = msg.ctxTok
-		if m.currentResp != "" {
-			m.messages = append(m.messages, chatMessage{role: "assistant", content: strings.TrimSpace(m.currentResp)})
+		finalResp := strings.TrimSpace(msg.content)
+		if finalResp == "" {
+			finalResp = strings.TrimSpace(m.currentResp)
+		}
+		if finalResp != "" {
+			m.messages = append(m.messages, chatMessage{role: "assistant", content: finalResp})
 			m.rendered = append(m.rendered, m.renderMessage(m.messages[len(m.messages)-1]))
 		}
 		m.currentResp = ""
@@ -1140,6 +1144,15 @@ func (m *model) handleMCP(arg string) (tea.Model, tea.Cmd) {
 				fail(fmt.Sprintf("MCP list tools error: %v%s", err, stderr))
 				return
 			}
+			if serverName == "ydc" {
+				var filtered []mcp.Tool
+				for _, t := range tools {
+					if t.Name == "you-search" || t.Name == "you-extract" {
+						filtered = append(filtered, t)
+					}
+				}
+				tools = filtered
+			}
 			toolDefs = mcp.ToolsToLLM(tools)
 			m.mcpToolCache[serverName] = toolDefs
 			send(fmt.Sprintf("tools loaded: %d", len(tools)))
@@ -1150,7 +1163,7 @@ func (m *model) handleMCP(arg string) (tea.Model, tea.Cmd) {
 		}
 
 		msgs := []llm.Message{
-			{Role: "system", Content: fmt.Sprintf("You have access to MCP tools on %s. Use them to fulfill the user's request.", serverName)},
+			{Role: "system", Content: fmt.Sprintf("You have access to MCP tools on %s. Use them to fulfill the user's request. Base your answer strictly on tool results, include specific facts/numbers, and cite sources with Markdown links.", serverName)},
 			{Role: "user", Content: instruction},
 		}
 
@@ -1191,8 +1204,20 @@ func (m *model) handleMCP(arg string) (tea.Model, tea.Cmd) {
 			for _, tc := range resp.ToolCalls {
 				var args map[string]interface{}
 				json.Unmarshal([]byte(tc.Function.Arguments), &args)
+				if tc.Function.Name == "you-search" {
+					if args == nil {
+						args = map[string]interface{}{}
+					}
+					if _, ok := args["count"]; !ok {
+						args["count"] = 4
+					}
+					
+				}
 				send(fmt.Sprintf("calling %s...", tc.Function.Name))
 				result, err := client.CallTool(tc.Function.Name, args)
+				if len(result) > 12000 {
+					result = result[:12000] + "\n...[truncated]"
+				}
 				if ctx.Err() != nil {
 					return
 				}
