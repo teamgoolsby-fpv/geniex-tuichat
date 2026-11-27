@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/atotto/clipboard"
 	"tuichat/config"
@@ -350,6 +352,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if finalResp != "" {
 			m.messages = append(m.messages, chatMessage{role: "assistant", content: finalResp})
 			m.rendered = append(m.rendered, m.renderMessage(m.messages[len(m.messages)-1]))
+			m.currentSession.AddMessage("assistant", finalResp)
+			m.currentSession.Model = m.activeModel
+			if m.currentSession.Name == "Untitled" {
+				m.currentSession.Name = m.currentSession.GenerateName()
+			}
+			m.currentSession.Save()
 		}
 		m.currentResp = ""
 		m.updateViewportContent()
@@ -1090,6 +1098,8 @@ func (m *model) handleMCP(arg string) (tea.Model, tea.Cmd) {
 	fullInput := fmt.Sprintf("/mcp %s", arg)
 	m.messages = append(m.messages, chatMessage{role: "user", content: fullInput})
 	m.rendered = append(m.rendered, m.renderMessage(m.messages[len(m.messages)-1]))
+	m.currentSession.AddMessage("user", fullInput)
+	m.currentSession.Save()
 	m.history = append(m.history, fullInput)
 	m.historyIdx = -1
 	m.savedInput = ""
@@ -1168,13 +1178,13 @@ func (m *model) handleMCP(arg string) (tea.Model, tea.Cmd) {
 		}
 
 		msgs := []llm.Message{
-			{Role: "system", Content: fmt.Sprintf(`You have access to MCP tools on %s. Use them to fulfill the user's request. Base your answer strictly on tool results, include specific facts/numbers, and cite sources with Markdown links.
+			{Role: "system", Content: fmt.Sprintf(`Today's date is %s. You have access to MCP tools on %s. Use them to fulfill the user's request. Base your answer strictly on tool results, include specific facts/numbers, and cite sources with Markdown links.
 
 Search & Source Rules:
 1. Always call you-search before answering—never answer from memory or guess URLs.
 2. Output at most one numbered item per unique URL returned verbatim by the tool. Never split one article into multiple items or invent URLs to hit a requested count.
 3. Never expand acronyms unless the exact expansion appears in the tool output.
-4. Use you-extract when a user asks for full details, tables, or parameters from a specific URL.`, serverName)},
+4. Use you-extract when a user asks for full details, tables, or parameters from a specific URL.`, time.Now().Format("2006-01-02"), serverName)},
 			{Role: "user", Content: instruction},
 		}
 
@@ -1357,26 +1367,25 @@ func addCopyLabels(s string, startIdx int) string {
 }
 
 func resolvePath(p string) (string, error) {
-	if strings.HasPrefix(p, "~/") {
+	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
 		}
-		p = home + p[1:]
+		if p == "~" {
+			return home, nil
+		}
+		p = filepath.Join(home, p[2:])
 	}
-	if len(p) > 0 && p[0] == '/' {
-		return p, nil
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p), nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
-	if cwd[len(cwd)-1] != '/' {
-		cwd += "/"
-	}
-	return cwd + p, nil
+	return filepath.Join(cwd, p), nil
 }
-
 func (m *model) startStream(input string) tea.Cmd {
 	if m.cancel != nil {
 		m.cancel()
