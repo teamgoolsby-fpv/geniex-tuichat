@@ -52,6 +52,7 @@ type mcpDoneMsg struct {
 	inputTok int
 	outTok   int
 	ctxTok   int
+	toolLogs []string
 }
 
 type modelItem struct {
@@ -338,6 +339,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inputTokens += msg.inputTok
 		m.outputTokens += msg.outTok
 		m.ctxTokens = msg.ctxTok
+		for _, logLine := range msg.toolLogs {
+			m.messages = append(m.messages, chatMessage{role: "system", content: logLine})
+			m.rendered = append(m.rendered, m.renderMessage(m.messages[len(m.messages)-1]))
+		}
 		finalResp := strings.TrimSpace(msg.content)
 		if finalResp == "" {
 			finalResp = strings.TrimSpace(m.currentResp)
@@ -1163,7 +1168,13 @@ func (m *model) handleMCP(arg string) (tea.Model, tea.Cmd) {
 		}
 
 		msgs := []llm.Message{
-			{Role: "system", Content: fmt.Sprintf("You have access to MCP tools on %s. Use them to fulfill the user's request. Base your answer strictly on tool results, include specific facts/numbers, and cite sources with Markdown links.", serverName)},
+			{Role: "system", Content: fmt.Sprintf(`You have access to MCP tools on %s. Use them to fulfill the user's request. Base your answer strictly on tool results, include specific facts/numbers, and cite sources with Markdown links.
+
+Search & Source Rules:
+1. Always call you-search before answering—never answer from memory or guess URLs.
+2. Output at most one numbered item per unique URL returned verbatim by the tool. Never split one article into multiple items or invent URLs to hit a requested count.
+3. Never expand acronyms unless the exact expansion appears in the tool output.
+4. Use you-extract when a user asks for full details, tables, or parameters from a specific URL.`, serverName)},
 			{Role: "user", Content: instruction},
 		}
 
@@ -1175,6 +1186,7 @@ func (m *model) handleMCP(arg string) (tea.Model, tea.Cmd) {
 		inputTok += len(string(toolJSON)) / 4
 		ctxTok := inputTok
 		outTok := 0
+		var toolLogs []string
 
 		for iter := 0; iter < 8; iter++ {
 			send("thinking...")
@@ -1193,38 +1205,47 @@ func (m *model) handleMCP(arg string) (tea.Model, tea.Cmd) {
 			}
 
 			if len(resp.ToolCalls) == 0 {
-				select {
-				case sub <- mcpDoneMsg{content: resp.Content, inputTok: inputTok, outTok: outTok, ctxTok: ctxTok}:
-				default:
-				}
-				return
-			}
+        if len(toolLogs) == 0 {
+                toolLogs = append(toolLogs, "[MCP] WARNING: model skipped tool call (answered from memory)")
+        }
+        select {
+        case sub <- mcpDoneMsg{content: resp.Content, inputTok: inputTok, outTok: outTok, ctxTok: ctxTok, toolLogs: toolLogs}:
+        default:
+        }
+        return
+}
 
 			msgs = append(msgs, resp)
 			for _, tc := range resp.ToolCalls {
 				var args map[string]interface{}
 				json.Unmarshal([]byte(tc.Function.Arguments), &args)
 				if tc.Function.Name == "you-search" {
-					if args == nil {
-						args = map[string]interface{}{}
-					}
-					if _, ok := args["count"]; !ok {
-						args["count"] = 4
-					}
-					
-				}
-				send(fmt.Sprintf("calling %s...", tc.Function.Name))
-				result, err := client.CallTool(tc.Function.Name, args)
-				if len(result) > 12000 {
-					result = result[:12000] + "\n...[truncated]"
-				}
-				if ctx.Err() != nil {
-					return
-				}
-				if err != nil {
-					result = fmt.Sprintf("tool error: %v", err)
-				}
-				msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: result})
+        if args == nil {
+                args = map[string]interface{}{}
+        }
+        if c, ok := args["count"].(float64); !ok || c > 6 || c < 1 {
+		args["count"] = 6
+	}
+	if _, isStr := args["extraction"].(string); isStr {
+                delete(args, "extraction")
+        }
+}
+argBytes, _ := json.Marshal(args)
+send(fmt.Sprintf("calling %s...", tc.Function.Name))
+result, err := client.CallTool(tc.Function.Name, args)
+if ctx.Err() != nil {
+        return
+}
+if err != nil {
+        toolLogs = append(toolLogs, fmt.Sprintf("[MCP] %s (ERROR: %v) %s", tc.Function.Name, err, string(argBytes)))
+        result = fmt.Sprintf("tool error: %v. Do NOT answer from memory or invent URLs—report this exact error to the user.", err)
+} else {
+        toolLogs = append(toolLogs, fmt.Sprintf("[MCP] %s (%d chars) %s", tc.Function.Name, len(result), string(argBytes)))
+        if len(result) > 36000 {
+                result = result[:36000] + "\n...[truncated]"
+        }
+}
+msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: result})
 			}
 		}
 
@@ -1233,7 +1254,6 @@ func (m *model) handleMCP(arg string) (tea.Model, tea.Cmd) {
 
 	return m, m.waitForStream()
 }
-
 func (m *model) handleCopy(arg string) (tea.Model, tea.Cmd) {
 	arg = strings.TrimSpace(arg)
 
@@ -1514,7 +1534,7 @@ func (m *model) renderMessage(msg chatMessage) string {
 		return header + "\n" + body
 
 	case "system":
-		return lipgloss.NewStyle().Italic(true).Foreground(systemColor).Render(msg.content)
+		return lipgloss.NewStyle().Italic(true).Foreground(systemColor).Width(m.glamourWidth()).Render(msg.content)
 
 	default:
 		return msg.content
