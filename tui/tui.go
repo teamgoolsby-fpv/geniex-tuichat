@@ -141,6 +141,7 @@ var commands = []struct {
 	{"/cp", "Copy last code block: /cp [N|all]"},
 	{"/read", "Read file: /read <path>"},
 	{"/mcp", "Run MCP tool: /mcp <server> <instruction>"},
+	{"/agent", "Research & save Obsidian note: /agent <topic>"},
 	{"/edit", "Open editor (ctrl+e)"},
 	{"/new", "New session"},
 	{"/rename", "Rename session"},
@@ -873,6 +874,8 @@ func (m *model) handleCommand(input string) (tea.Model, tea.Cmd) {
 
 	case strings.HasPrefix(input, "/mcp "):
 		return m.handleMCP(strings.TrimPrefix(input, "/mcp "))
+	case strings.HasPrefix(input, "/agent "):
+		return m.handleAgent(strings.TrimPrefix(input, "/agent "))
 
 	case strings.HasPrefix(input, "/rename "):
 		name := strings.TrimPrefix(input, "/rename ")
@@ -1260,6 +1263,284 @@ msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: result
 		}
 
 		fail("MCP: max iterations reached")
+	}()
+
+	return m, m.waitForStream()
+}
+const obsidianVaultDir = `C:\Users\Pops-Stuff\Documents\Obsidian\AI Knowledge Collector`
+
+func saveMarkdownNote(filename, content string) (string, error) {
+	name := strings.TrimSpace(filename)
+	name = filepath.Base(name)
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		return "", fmt.Errorf("invalid filename")
+	}
+	// Strip characters Windows forbids in filenames
+	for _, bad := range []string{"<", ">", ":", "\"", "/", "\\", "|", "?", "*"} {
+		name = strings.ReplaceAll(name, bad, "-")
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".md") {
+		name += ".md"
+	}
+	if err := os.MkdirAll(obsidianVaultDir, 0o755); err != nil {
+		return "", err
+	}
+	fullPath := filepath.Join(obsidianVaultDir, name)
+	if strings.HasPrefix(content, "---\n") {
+		if end := strings.Index(content[4:], "\n---"); end != -1 {
+			fmLines := strings.Split(content[4:4+end], "\n")
+			for i, line := range fmLines {
+				fmLines[i] = strings.TrimLeft(line, " \t")
+			}
+			content = "---\n" + strings.Join(fmLines, "\n") + content[4+end:]
+		}
+	}
+	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return fullPath, nil
+}
+
+func (m *model) handleAgent(topic string) (tea.Model, tea.Cmd) {
+	topic = strings.TrimSpace(topic)
+	if topic == "" {
+		m.messages = append(m.messages, chatMessage{role: "system", content: "Usage: /agent <research topic>"})
+		m.rendered = append(m.rendered, m.renderMessage(m.messages[len(m.messages)-1]))
+		m.updateViewportContent()
+		return m, nil
+	}
+
+	if m.cancel != nil {
+		m.cancel()
+	}
+	if m.activeProvider == nil {
+		m.messages = append(m.messages, chatMessage{role: "system", content: "No provider configured."})
+		m.rendered = append(m.rendered, m.renderMessage(m.messages[len(m.messages)-1]))
+		m.updateViewportContent()
+		return m, nil
+	}
+	if m.cfg.MCP == nil || m.cfg.MCP.Servers == nil {
+		m.messages = append(m.messages, chatMessage{role: "system", content: "No MCP servers configured in config.yaml."})
+		m.rendered = append(m.rendered, m.renderMessage(m.messages[len(m.messages)-1]))
+		m.updateViewportContent()
+		return m, nil
+	}
+	entry, ok := m.cfg.MCP.Servers["ydc"]
+	if !ok {
+		m.messages = append(m.messages, chatMessage{role: "system", content: "MCP server 'ydc' not found in config.yaml."})
+		m.rendered = append(m.rendered, m.renderMessage(m.messages[len(m.messages)-1]))
+		m.updateViewportContent()
+		return m, nil
+	}
+
+	fullInput := fmt.Sprintf("/agent %s", topic)
+	m.messages = append(m.messages, chatMessage{role: "user", content: fullInput})
+	m.rendered = append(m.rendered, m.renderMessage(m.messages[len(m.messages)-1]))
+	m.currentSession.AddMessage("user", fullInput)
+	m.currentSession.Save()
+	m.history = append(m.history, fullInput)
+	m.historyIdx = -1
+	m.savedInput = ""
+	m.loading = true
+	m.currentResp = ""
+
+	sub := make(chan tea.Msg, 128)
+	m.sub = sub
+	baseURL := m.activeProvider.BaseURL
+	apiKey := m.activeProvider.APIKey
+	modelID := m.activeModel
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+
+	go func() {
+		defer cancel()
+
+		var toolLogs []string
+		send := func(msg string) {
+			select {
+			case sub <- mcpProgressMsg(msg):
+			default:
+			}
+		}
+		fail := func(msg string) {
+			select {
+			case sub <- mcpDoneMsg{content: msg, toolLogs: toolLogs}:
+			default:
+			}
+		}
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		send("starting research agent (ydc)...")
+		client, err := mcp.NewClient(entry.Command, entry.Args)
+		if err != nil {
+			fail(fmt.Sprintf("MCP error: %v", err))
+			return
+		}
+		defer client.Close()
+
+		var mcpDefs []llm.ToolDefinition
+		if cached, ok := m.mcpToolCache["ydc"]; ok {
+			mcpDefs = cached
+		} else {
+			send("listing ydc tools...")
+			tools, err := client.ListTools()
+			if err != nil {
+				fail(fmt.Sprintf("MCP list tools error: %v", err))
+				return
+			}
+			var filtered []mcp.Tool
+			for _, t := range tools {
+				if t.Name == "you-search" || t.Name == "you-extract" {
+					filtered = append(filtered, t)
+				}
+			}
+			mcpDefs = mcp.ToolsToLLM(filtered)
+			m.mcpToolCache["ydc"] = mcpDefs
+		}
+
+		// Copy cached MCP tools and append local Obsidian note writer
+		toolDefs := make([]llm.ToolDefinition, len(mcpDefs), len(mcpDefs)+1)
+		copy(toolDefs, mcpDefs)
+		toolDefs = append(toolDefs, llm.ToolDefinition{
+			Type: "function",
+			Function: llm.ToolDefFunc{
+				Name:        "save_markdown_note",
+				Description: "Save a formatted Markdown research note to the user's Obsidian vault.",
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"filename": map[string]interface{}{
+							"type":        "string",
+							"description": "Short, descriptive filename ending in .md (e.g., 2027-US-Open-Pickleball-Guide.md)",
+						},
+						"content": map[string]interface{}{
+							"type":        "string",
+							"description": "Complete Markdown note including YAML frontmatter (title, date, tags), headings, checklists, and verbatim source links.",
+						},
+					},
+					"required": []string{"filename", "content"},
+				},
+			},
+		})
+
+today := time.Now().Format("2006-01-02")
+		msgs := []llm.Message{
+			{Role: "system", Content: fmt.Sprintf(`Today's date is %s. You are a multi-step research agent. Follow this exact 3-step workflow:
+
+1. SEARCH: Call you-search with clean English keywords (include "registration" or "official site" when researching how to enter an event).
+2. EXTRACT: Call you-extract on the single most authoritative official English website returned by you-search (prefer the official event/organization domain over foreign federations, news blurbs, or directories) to get exact dates, rules, fees, and steps.
+2b. VERIFY: If the extracted page is missing key details OR shows dates from a past year (earlier than today's date or the target year), run ONE follow-up you-search targeting the target year's official page and call you-extract on it before saving.
+3. SAVE: Call save_markdown_note to write a concise Obsidian Markdown note (under 600 words) containing:
+   - Valid YAML frontmatter with NO leading spaces before keys (title, date: %s, tags)
+   - Key Dates & Deadlines
+   - Eligibility, Registration & Costs
+   - Step-by-Step Action Checklist
+   - Sources (at most 3-5 verbatim URLs—NEVER copy site navigation or footer links)
+
+Rules:
+- Never answer from memory or invent URLs, dates, or fees.
+- Keep the note concise so the tool call JSON completes cleanly.
+- After save_markdown_note succeeds, reply to the user with a brief summary and the saved file path.`, today, today)},
+			{Role: "user", Content: topic},
+		}
+		inputTok := 0
+		for _, msg := range msgs {
+			inputTok += session.EstimateTokens(msg.Content)
+		}
+		toolJSON, _ := json.Marshal(toolDefs)
+		inputTok += len(string(toolJSON)) / 4
+		ctxTok := inputTok
+		outTok := 0
+	
+		for iter := 0; iter < 8; iter++ {
+			send(fmt.Sprintf("agent step %d: thinking...", iter+1))
+			resp, err := llm.ChatWithTools(baseURL, apiKey, modelID, msgs, toolDefs)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				fail(fmt.Sprintf("LLM error: %v", err))
+				return
+			}
+
+			outTok += session.EstimateTokens(resp.Content)
+			for _, tc := range resp.ToolCalls {
+				outTok += session.EstimateTokens(tc.Function.Name + tc.Function.Arguments)
+			}
+
+			if len(resp.ToolCalls) == 0 {
+				if len(toolLogs) == 0 {
+					toolLogs = append(toolLogs, "[AGENT] WARNING: model skipped all tools (answered from memory)")
+				}
+				select {
+				case sub <- mcpDoneMsg{content: resp.Content, inputTok: inputTok, outTok: outTok, ctxTok: ctxTok, toolLogs: toolLogs}:
+				default:
+				}
+				return
+			}
+
+			msgs = append(msgs, resp)
+			for _, tc := range resp.ToolCalls {
+				var args map[string]interface{}
+				json.Unmarshal([]byte(tc.Function.Arguments), &args)
+
+				if tc.Function.Name == "save_markdown_note" {
+					fn, _ := args["filename"].(string)
+					body, _ := args["content"].(string)
+					send(fmt.Sprintf("saving Obsidian note: %s...", fn))
+					savedPath, err := saveMarkdownNote(fn, body)
+					var result string
+					if err != nil {
+						toolLogs = append(toolLogs, fmt.Sprintf("[AGENT] save_markdown_note (ERROR: %v)", err))
+						result = fmt.Sprintf("error saving note: %v", err)
+					} else {
+						toolLogs = append(toolLogs, fmt.Sprintf("[AGENT] saved %s (%d chars)", savedPath, len(body)))
+						result = fmt.Sprintf("Successfully saved Markdown note to: %s", savedPath)
+					}
+					msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: result})
+					continue
+				}
+
+if tc.Function.Name == "you-search" {
+					if args == nil {
+						args = map[string]interface{}{}
+					}
+					if c, ok := args["count"].(float64); !ok || c > 4 || c < 1 {
+						args["count"] = 4
+					}
+					if _, isStr := args["extraction"].(string); isStr {
+						delete(args, "extraction")
+					}
+					delete(args, "freshness")
+				}
+				argBytes, _ := json.Marshal(args)
+				send(fmt.Sprintf("calling %s...", tc.Function.Name))
+				result, err := client.CallTool(tc.Function.Name, args)
+				if ctx.Err() != nil {
+					return
+				}
+				if err != nil {
+					toolLogs = append(toolLogs, fmt.Sprintf("[MCP] %s (ERROR: %v) %s", tc.Function.Name, err, string(argBytes)))
+					result = fmt.Sprintf("tool error: %v. Do NOT answer from memory or invent URLs—report this exact error to the user.", err)
+				} else {
+					toolLogs = append(toolLogs, fmt.Sprintf("[MCP] %s (%d chars) %s", tc.Function.Name, len(result), string(argBytes)))
+					limit := 10000
+					if tc.Function.Name == "you-search" {
+						limit = 18000
+					}
+					if len(result) > limit {
+						result = result[:limit] + "\n...[truncated]"
+					}
+				}
+				msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: result})
+			}
+		}
+
+		fail("Agent: max iterations reached")
 	}()
 
 	return m, m.waitForStream()
